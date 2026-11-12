@@ -21,6 +21,7 @@ export interface AccountSummary {
   realized_pnl: number;
   daily_pnl: number;
   currency: string;
+  currency_balances?: Record<string, number>;
 }
 
 export interface Position {
@@ -453,5 +454,40 @@ export interface DashboardSnapshot {
   strategies: StrategyInfo[];
   reconciliation: ReconciliationReport | null;
   activity: ActivityEvent[];
+}
+
+export interface CurrencyConversionRequest {
+  from_currency: string;
+  to_currency: string;
+  amount: number;
+  amount_currency: string;
+  order_type: "MKT" | "LMT";
+  limit_price?: number;
+  exchange: "IDEALPRO" | "FXCONV";
+}
+
+export interface CurrencyConversionResult {
+  success: boolean;
+  order_id: number | null;
+  from_currency: string;
+  to_currency: string;
+  from_amount: number;
+  to_amount: number;
+  rate: number;
+  exchange: string;
+  status: string;
+  message: string;
+  created_at: string;
+}
+
+export interface FxRateResponse {
+  pair: string;
+  base_currency: string;
+  quote_currency: string;
+  rate: number;
+  bid: number;
+  ask: number;
+  inverse_rate: number;
+  updated_at: string;
 }
 

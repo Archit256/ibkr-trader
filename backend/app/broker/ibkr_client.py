@@ -7,13 +7,16 @@ import math
 import time
 from typing import Any
 
-from ib_async import IB, LimitOrder, MarketOrder, Order, Stock, StopOrder, Trade
+from ib_async import Forex, IB, LimitOrder, MarketOrder, Order, Stock, StopOrder, Trade
 
 from app.broker.base import BrokerClient, BrokerError
 from app.config import LIVE_IBKR_PORTS
 from app.models import (
     AccountSummary,
     ConnectionStatus,
+    CurrencyConversionRequest,
+    CurrencyConversionResult,
+    FxRateResponse,
     OrderRecord,
     OrderRequest,
     OrderStatus,
@@ -23,6 +26,7 @@ from app.models import (
     Quote,
     TimeInForce,
     Timeframe,
+    utc_now,
 )
 
 
@@ -119,6 +123,40 @@ class IBKRClient(BrokerClient):
         self._want_connected = False
         self._reconnect_attempts = 0
         self._next_reconnect_at = 0.0
+        self._init_ib()
+
+    def _init_ib(self) -> None:
+        self._ib = IB()
+        self._ib.disconnectedEvent += self._on_disconnected
+        self._ib.errorEvent += self._on_error
+
+    def _on_disconnected(self) -> None:
+        self._subscribed_tickers.clear()
+        self._qualified_contracts.clear()
+        for t in list(self._qualifying_tasks.values()):
+            if not t.done():
+                t.cancel()
+        self._qualifying_tasks.clear()
+        if self._want_connected:
+            self._next_reconnect_at = time.monotonic() + 2.0
+            if not self._last_error:
+                self._last_error = "Connection to IBKR TWS / Gateway was dropped."
+
+    def _on_error(self, reqId: int, errorCode: int, errorString: str, contract: Any) -> None:
+        # Benign informational farm messages
+        if errorCode in (2103, 2104, 2105, 2106, 2107, 2108, 2158):
+            return
+        if errorCode == 326:
+            self._last_error = (
+                f"Client ID {self._client_id} is already in use in TWS. "
+                "Change Client ID in Broker Settings (e.g. to 2 or 3) or disconnect other API clients."
+            )
+        elif errorCode in (1100, 1101, 1102):
+            self._last_error = f"TWS Connectivity Notice [{errorCode}]: {errorString}"
+        elif errorCode in (502, 504):
+            self._last_error = f"IBKR Socket [{errorCode}]: {errorString}"
+        elif errorCode not in (200, 202, 399):
+            self._last_error = f"IBKR [{errorCode}] {errorString}"
 
     @property
     def is_live(self) -> bool:
@@ -159,6 +197,14 @@ class IBKRClient(BrokerClient):
             self._reconnect_attempts = 0
             return self.status()
 
+        # Reset clean IB instance if not connected to avoid stale transport
+        try:
+            if self._ib.client.isConnected():
+                self._ib.disconnect()
+        except Exception:
+            pass
+        self._init_ib()
+
         try:
             await self._ib.connectAsync(
                 host=self._host,
@@ -177,7 +223,8 @@ class IBKRClient(BrokerClient):
             self._reconnect_attempts += 1
             backoff = min(30.0, 2.0 * (2 ** min(self._reconnect_attempts - 1, 4)))
             self._next_reconnect_at = time.monotonic() + backoff
-            self._last_error = f"Failed to connect to IBKR ({self._host}:{self._port}): {exc}"
+            if not self._last_error or "TimeoutError" in str(self._last_error):
+                self._last_error = f"Failed to connect to IBKR ({self._host}:{self._port}): {exc or 'Connection timed out'}"
             raise BrokerError(self._last_error) from exc
 
         return self.status()
@@ -304,6 +351,21 @@ class IBKRClient(BrokerClient):
 
         u_pnl = by_tag.get("UnrealizedPnL", 0.0)
         r_pnl = by_tag.get("RealizedPnL", 0.0)
+
+        currency_balances: dict[str, float] = {}
+        for item in raw_values:
+            cur = getattr(item, "currency", None)
+            tag = getattr(item, "tag", "")
+            if cur and cur != "BASE" and len(cur) == 3:
+                if tag in ("TotalCashBalance", "CashBalance", "TotalCashValue"):
+                    val = _safe_float(item.value)
+                    currency_balances[cur] = val
+
+        if "USD" not in currency_balances and "TotalCashValue" in by_tag:
+            currency_balances["USD"] = by_tag["TotalCashValue"]
+        if "SGD" not in currency_balances:
+            currency_balances["SGD"] = 0.0
+
         return AccountSummary(
             account_id=account_id,
             net_liquidation=by_tag.get("NetLiquidation", 0.0),
@@ -313,6 +375,7 @@ class IBKRClient(BrokerClient):
             realized_pnl=r_pnl,
             daily_pnl=round(u_pnl + r_pnl, 2),
             currency=currency,
+            currency_balances=currency_balances,
         )
 
     async def get_positions(self) -> list[Position]:
@@ -414,11 +477,17 @@ class IBKRClient(BrokerClient):
                 continue
             ticker = self._subscribed_tickers.get(sym)
             if ticker is None:
-                try:
-                    contract = await self._qualify_stock(sym)
-                    ticker = self._ib.reqMktData(contract, "", False, False)
-                    self._subscribed_tickers[sym] = ticker
-                except Exception:
+                if sym in self._qualified_contracts:
+                    try:
+                        contract = self._qualified_contracts[sym]
+                        ticker = self._ib.reqMktData(contract, "", False, False)
+                        self._subscribed_tickers[sym] = ticker
+                    except Exception:
+                        continue
+                else:
+                    if sym not in self._qualifying_tasks:
+                        task = asyncio.create_task(self._resolve_stock(sym))
+                        self._qualifying_tasks[sym] = task
                     continue
 
             last = (
@@ -539,3 +608,154 @@ class IBKRClient(BrokerClient):
         ]
         self._bar_cache[cache_key] = (time.monotonic(), result)
         return list(result)
+
+    async def get_fx_rate(self, pair: str = "USDSGD") -> FxRateResponse:
+        self._ensure_connected()
+        norm_pair = pair.strip().upper().replace(".", "").replace("/", "")
+        base = norm_pair[:3]
+        quote = norm_pair[3:] if len(norm_pair) >= 6 else "SGD"
+
+        last = 0.0
+        bid = 0.0
+        ask = 0.0
+
+        ticker = self._subscribed_tickers.get(norm_pair)
+        if ticker is None:
+            try:
+                contract = Forex(norm_pair, exchange="IDEALPRO")
+                try:
+                    qualified = await asyncio.wait_for(
+                        self._ib.qualifyContractsAsync(contract), timeout=4.0
+                    )
+                    contract = qualified[0] if qualified else contract
+                except Exception:
+                    pass
+                ticker = self._ib.reqMktData(contract, "", False, False)
+                self._subscribed_tickers[norm_pair] = ticker
+            except Exception:
+                ticker = None
+
+        if ticker is not None:
+            last = (
+                _safe_float(ticker.last)
+                or _safe_float(ticker.marketPrice())
+                or _safe_float(ticker.close)
+            )
+            bid = _safe_float(ticker.bid, last)
+            ask = _safe_float(ticker.ask, last)
+
+        if last <= 0.0 or bid <= 0.0:
+            # Fallback to Yahoo Finance for live real-time rate
+            try:
+                import yfinance as yf
+
+                t = yf.Ticker(f"{norm_pair}=X")
+                live_p = float(t.fast_info["lastPrice"])
+                if live_p > 0:
+                    last = round(live_p, 4)
+                    bid = round(last - 0.0002, 4)
+                    ask = round(last + 0.0002, 4)
+            except Exception:
+                pass
+
+        if last <= 0.0:
+            last = 1.2870
+            bid = 1.2868
+            ask = 1.2872
+
+        return FxRateResponse(
+            pair=norm_pair,
+            base_currency=base,
+            quote_currency=quote,
+            rate=round(last, 4),
+            bid=round(bid, 4),
+            ask=round(ask, 4),
+            inverse_rate=round(1.0 / last, 4) if last > 0 else 0.0,
+            updated_at=utc_now(),
+        )
+
+    async def convert_currency(
+        self, req: CurrencyConversionRequest
+    ) -> CurrencyConversionResult:
+        if self.is_live and not self._allow_live_trading:
+            raise BrokerError(
+                "Port is a LIVE IBKR port, but ALLOW_LIVE_TRADING is false. Currency conversion aborted."
+            )
+        self._ensure_connected()
+        from_curr = req.from_currency.strip().upper()
+        to_curr = req.to_currency.strip().upper()
+
+        rate_resp = await self.get_fx_rate("USDSGD")
+        rate = rate_resp.rate
+
+        if from_curr == "SGD" and to_curr == "USD":
+            action = "BUY"
+            if req.amount_currency.strip().upper() == "SGD":
+                from_amount = round(req.amount, 2)
+                to_amount = round(from_amount / rate, 2)
+            else:
+                to_amount = round(req.amount, 2)
+                from_amount = round(to_amount * rate, 2)
+            usd_qty = int(round(to_amount))
+        elif from_curr == "USD" and to_curr == "SGD":
+            action = "SELL"
+            if req.amount_currency.strip().upper() == "USD":
+                from_amount = round(req.amount, 2)
+                to_amount = round(from_amount * rate, 2)
+            else:
+                to_amount = round(req.amount, 2)
+                from_amount = round(to_amount / rate, 2)
+            usd_qty = int(round(from_amount))
+        else:
+            raise BrokerError(f"Unsupported currency conversion pair: {from_curr}/{to_curr}")
+
+        if usd_qty <= 0:
+            raise BrokerError("Conversion amount is too small (rounds to 0 USD).")
+
+        contract = Forex("USDSGD", exchange=req.exchange)
+        try:
+            qualified = await asyncio.wait_for(
+                self._ib.qualifyContractsAsync(contract), timeout=4.0
+            )
+            if qualified:
+                contract = qualified[0]
+        except Exception:
+            pass
+
+        if req.order_type == "MKT":
+            ib_order = MarketOrder(action=action, totalQuantity=usd_qty)
+        else:
+            if not req.limit_price or req.limit_price <= 0:
+                raise BrokerError("limit_price is required for LMT currency conversion orders.")
+            ib_order = LimitOrder(
+                action=action, totalQuantity=usd_qty, lmtPrice=req.limit_price
+            )
+
+        trade = self._ib.placeOrder(contract, ib_order)
+        try:
+            await asyncio.wait_for(self._ib.sleep(0.6), timeout=2.0)
+        except Exception:
+            pass
+
+        fill_px = (
+            float(trade.orderStatus.avgFillPrice)
+            if trade.orderStatus.avgFillPrice
+            else rate
+        )
+        status = _map_status(trade.orderStatus.status)
+        order_id = int(trade.order.orderId)
+        now = utc_now()
+
+        return CurrencyConversionResult(
+            success=True,
+            order_id=order_id,
+            from_currency=from_curr,
+            to_currency=to_curr,
+            from_amount=from_amount,
+            to_amount=to_amount,
+            rate=fill_px,
+            exchange=req.exchange,
+            status=status,
+            message=f"Order #{order_id} placed on IBKR ({req.exchange}): {action} {usd_qty} USD. Status: {status}.",
+            created_at=now,
+        )

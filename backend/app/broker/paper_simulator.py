@@ -9,6 +9,9 @@ from app.broker.base import BrokerClient, BrokerError
 from app.models import (
     AccountSummary,
     ConnectionStatus,
+    CurrencyConversionRequest,
+    CurrencyConversionResult,
+    FxRateResponse,
     OrderRecord,
     OrderRequest,
     Position,
@@ -30,6 +33,7 @@ SEED_PRICES: dict[str, float] = {
     "AMZN": 208.35,
     "META": 584.10,
     "AMD": 146.20,
+    "USDSGD": 1.2870,
 }
 
 
@@ -48,6 +52,10 @@ class PaperSimulator(BrokerClient):
         self._connected = True
         self._initial_cash = initial_cash
         self._cash = initial_cash
+        self._currency_balances: dict[str, float] = {
+            "USD": initial_cash,
+            "SGD": 50_000.0,
+        }
         self._realized_pnl = 0.0
         self._next_order_id = 1001
         self._positions: dict[str, _SimulatedPosition] = {}
@@ -59,10 +67,38 @@ class PaperSimulator(BrokerClient):
             self._init_history(sym)
 
     def _init_history(self, symbol: str, num_bars: int = 300) -> None:
+        if symbol == "USDSGD":
+            base = self._prices.setdefault(symbol, 1.2870)
+            self._open_prices.setdefault(symbol, base)
+            now = datetime.now(timezone.utc)
+            bars: list[PriceBar] = []
+            price = base
+            for i in range(num_bars):
+                ts = now - timedelta(minutes=num_bars - i)
+                delta = self._rng.gauss(0.0, 0.0003)
+                open_p = round(price, 4)
+                close_p = round(max(1.0, open_p + delta), 4)
+                high_p = round(max(open_p, close_p) + abs(self._rng.gauss(0, 0.0002)), 4)
+                low_p = round(max(0.9, min(open_p, close_p) - abs(self._rng.gauss(0, 0.0002))), 4)
+                bars.append(
+                    PriceBar(
+                        time=ts.strftime("%H:%M"),
+                        open=open_p,
+                        high=high_p,
+                        low=low_p,
+                        close=close_p,
+                        volume=self._rng.randint(100_000, 500_000),
+                    )
+                )
+                price = close_p
+            self._prices[symbol] = bars[-1].close
+            self._bars[symbol] = bars
+            return
+
         base = self._prices.setdefault(symbol, round(self._rng.uniform(50.0, 350.0), 2))
         self._open_prices.setdefault(symbol, base)
         now = datetime.now(timezone.utc)
-        bars: list[PriceBar] = []
+        bars = []
         price = base * 0.96
         for i in range(num_bars):
             ts = now - timedelta(minutes=num_bars - i)
@@ -292,6 +328,7 @@ class PaperSimulator(BrokerClient):
             realized_pnl=round(self._realized_pnl, 2),
             daily_pnl=daily_pnl,
             currency="USD",
+            currency_balances=dict(self._currency_balances),
         )
 
     async def get_positions(self) -> list[Position]:
@@ -403,3 +440,115 @@ class PaperSimulator(BrokerClient):
         if sym not in self._bars:
             self._init_history(sym)
         return list(self._bars[sym][-count:])
+
+    async def get_fx_rate(self, pair: str = "USDSGD") -> FxRateResponse:
+        self._ensure_connected()
+        norm_pair = pair.strip().upper().replace(".", "").replace("/", "")
+        rate = self._prices.get(norm_pair, 1.2870)
+        spread = 0.0004
+        bid = round(rate - spread / 2, 4)
+        ask = round(rate + spread / 2, 4)
+        base = norm_pair[:3]
+        quote = norm_pair[3:] if len(norm_pair) >= 6 else "SGD"
+        return FxRateResponse(
+            pair=norm_pair,
+            base_currency=base,
+            quote_currency=quote,
+            rate=round(rate, 4),
+            bid=bid,
+            ask=ask,
+            inverse_rate=round(1.0 / rate, 4) if rate > 0 else 0.0,
+            updated_at=utc_now(),
+        )
+
+    async def convert_currency(
+        self, req: CurrencyConversionRequest
+    ) -> CurrencyConversionResult:
+        self._ensure_connected()
+        from_curr = req.from_currency.strip().upper()
+        to_curr = req.to_currency.strip().upper()
+        if from_curr == to_curr:
+            raise BrokerError("Source and target currencies must be different.")
+
+        rate_resp = await self.get_fx_rate("USDSGD")
+        rate = rate_resp.rate
+
+        if from_curr == "SGD" and to_curr == "USD":
+            if req.amount_currency.strip().upper() == "SGD":
+                from_amount = round(req.amount, 2)
+                to_amount = round(from_amount / rate, 2)
+            else:
+                to_amount = round(req.amount, 2)
+                from_amount = round(to_amount * rate, 2)
+
+            current_sgd = self._currency_balances.get("SGD", 0.0)
+            if from_amount > current_sgd:
+                raise BrokerError(
+                    f"Insufficient SGD balance: required {from_amount:,.2f} SGD, but available balance is {current_sgd:,.2f} SGD."
+                )
+
+            self._currency_balances["SGD"] = round(current_sgd - from_amount, 2)
+            self._currency_balances["USD"] = round(
+                self._currency_balances.get("USD", 0.0) + to_amount, 2
+            )
+            self._cash = self._currency_balances["USD"]
+            side = "BUY"
+            usd_qty = int(round(to_amount))
+        elif from_curr == "USD" and to_curr == "SGD":
+            if req.amount_currency.strip().upper() == "USD":
+                from_amount = round(req.amount, 2)
+                to_amount = round(from_amount * rate, 2)
+            else:
+                to_amount = round(req.amount, 2)
+                from_amount = round(to_amount / rate, 2)
+
+            current_usd = self._currency_balances.get("USD", 0.0)
+            if from_amount > current_usd:
+                raise BrokerError(
+                    f"Insufficient USD balance: required {from_amount:,.2f} USD, but available balance is {current_usd:,.2f} USD."
+                )
+
+            self._currency_balances["USD"] = round(current_usd - from_amount, 2)
+            self._currency_balances["SGD"] = round(
+                self._currency_balances.get("SGD", 0.0) + to_amount, 2
+            )
+            self._cash = self._currency_balances["USD"]
+            side = "SELL"
+            usd_qty = int(round(from_amount))
+        else:
+            raise BrokerError(f"Unsupported currency conversion pair: {from_curr}/{to_curr}")
+
+        order_id = self._next_order_id
+        self._next_order_id += 1
+        now = utc_now()
+        record = OrderRecord(
+            order_id=order_id,
+            symbol="USD.SGD",
+            side=side,
+            quantity=usd_qty,
+            filled_quantity=usd_qty,
+            order_type=req.order_type,
+            limit_price=req.limit_price,
+            avg_fill_price=rate,
+            tif="DAY",
+            status="Filled",
+            source="fx:convert",
+            message=f"Converted {from_amount:,.2f} {from_curr} to {to_amount:,.2f} {to_curr} @ {rate:.4f} via {req.exchange}",
+            created_at=now,
+            updated_at=now,
+        )
+        self._orders[order_id] = record
+
+        return CurrencyConversionResult(
+            success=True,
+            order_id=order_id,
+            from_currency=from_curr,
+            to_currency=to_curr,
+            from_amount=from_amount,
+            to_amount=to_amount,
+            rate=rate,
+            exchange=req.exchange,
+            status="Filled",
+            message=f"Successfully converted {from_amount:,.2f} {from_curr} to {to_amount:,.2f} {to_curr} at rate {rate:.4f} ({req.exchange}).",
+            created_at=now,
+        )

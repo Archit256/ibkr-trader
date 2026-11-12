@@ -8,7 +8,7 @@ build:
 
 dev:
 	@trap 'kill 0' EXIT; \
-	(cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000 --timeout-graceful-shutdown 2) & \
+	(cd backend && .venv/bin/uvicorn app.main:app --reload --reload-dir app --port 8000 --timeout-graceful-shutdown 2) & \
 	(cd frontend && npm run dev) & \
 	wait
 

@@ -6,9 +6,12 @@ import type {
   BotDryRunPreview,
   BrokerMode,
   ConnectionStatus,
+  CurrencyConversionRequest,
+  CurrencyConversionResult,
   DashboardSnapshot,
   DataSource,
   DualMomentumPreview,
+  FxRateResponse,
   NewsCheckResult,
   OrderRecord,
   OrderRequest,
@@ -159,5 +162,12 @@ export const api = {
     }),
   previewDualMomentum: () =>
     request<DualMomentumPreview>("/api/strategies/dual-momentum/preview"),
+  getFxRate: (pair = "USDSGD") =>
+    request<FxRateResponse>(`/api/fx/rate?pair=${encodeURIComponent(pair)}`),
+  convertCurrency: (body: CurrencyConversionRequest) =>
+    request<CurrencyConversionResult>("/api/fx/convert", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 };
 

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   AlertOctagon,
+  ArrowDownUp,
   Bot,
   FlaskConical,
   LayoutDashboard,
@@ -19,6 +20,7 @@ import {
 import { api } from "./api";
 import { BacktestLab } from "./components/BacktestLab";
 import { BotFleetPanel } from "./components/BotFleetPanel";
+import { CurrencyConverterModal } from "./components/CurrencyConverterModal";
 import { OrderTicket } from "./components/OrderTicket";
 import { PositionsOrders } from "./components/PositionsOrders";
 import { PriceChart } from "./components/PriceChart";
@@ -60,6 +62,7 @@ export function App() {
   const [wsLive, setWsLive] = useState(false);
   const [connError, setConnError] = useState<string | null>(null);
   const [showBrokerConfig, setShowBrokerConfig] = useState(false);
+  const [showConvertModal, setShowConvertModal] = useState(false);
 
   const [ibHost, setIbHost] = useState("127.0.0.1");
   const [ibPort, setIbPort] = useState("7497");
@@ -148,11 +151,10 @@ export function App() {
   const autoConnectAttemptedRef = useRef(false);
 
   useEffect(() => {
-    if (!snapshot || autoConnectAttemptedRef.current) return;
-    autoConnectAttemptedRef.current = true;
-    if (snapshot.connection.connected) return;
+    if (!snapshot) return;
     const raw = localStorage.getItem("ibkr_trader_autoconnect");
     if (!raw) return;
+    if (autoConnectAttemptedRef.current) return;
     try {
       const saved = JSON.parse(raw) as {
         mode: BrokerMode;
@@ -160,29 +162,31 @@ export function App() {
         port?: number;
         clientId?: number;
       };
-      if (!saved?.mode) return;
-      (async () => {
-        try {
-          if (saved.mode === "ibkr") {
-            const h = saved.host || "127.0.0.1";
-            const p = saved.port || 7497;
-            const cid = saved.clientId || 1;
-            setIbHost(h);
-            setIbPort(String(p));
-            setIbClientId(String(cid));
-            await api.switchMode("ibkr", h, p, cid);
-          } else if (snapshot.connection.broker_mode !== "simulator") {
-            await api.switchMode("simulator", "127.0.0.1", 7497, 1);
-          }
-          await api.connect();
-          await loadSnapshot();
-        } catch (err) {
-          setConnError(
-            err instanceof Error ? `Auto-connect failed: ${err.message}` : "Auto-connect failed"
-          );
-          await loadSnapshot();
+      if (saved?.mode === "ibkr") {
+        const h = saved.host || "127.0.0.1";
+        const p = saved.port || 7497;
+        const cid = saved.clientId || 1;
+        setIbHost(h);
+        setIbPort(String(p));
+        setIbClientId(String(cid));
+        if (snapshot.connection.broker_mode === "ibkr" && snapshot.connection.connected) {
+          autoConnectAttemptedRef.current = true;
+          return;
         }
-      })();
+        autoConnectAttemptedRef.current = true;
+        (async () => {
+          try {
+            await api.switchMode("ibkr", h, p, cid);
+            await api.connect();
+            await loadSnapshot();
+          } catch (err) {
+            setConnError(
+              err instanceof Error ? `Auto-connect failed: ${err.message}` : "Auto-connect failed"
+            );
+            await loadSnapshot();
+          }
+        })();
+      }
     } catch {
       localStorage.removeItem("ibkr_trader_autoconnect");
     }
@@ -328,6 +332,15 @@ export function App() {
           </div>
 
           <button
+            className="btn-outline fx-nav-btn"
+            onClick={() => setShowConvertModal(true)}
+            title="Convert Cash Balance (SGD ⇄ USD)"
+          >
+            <ArrowDownUp size={15} />
+            Convert SGD ⇄ USD
+          </button>
+
+          <button
             className="btn-outline"
             onClick={() => setShowBrokerConfig((v) => !v)}
           >
@@ -367,6 +380,22 @@ export function App() {
         </div>
       )}
 
+      {conn?.broker_mode === "ibkr" && !conn.connected && (
+        <div className="banner-error">
+          <ShieldAlert size={16} />
+          <span>
+            IBKR DISCONNECTED: {conn.last_error || "Connection to TWS / IB Gateway lost."}
+          </span>
+          <button
+            className="mini-btn"
+            style={{ marginLeft: "auto", cursor: "pointer" }}
+            onClick={() => handleModeSwitch("ibkr")}
+          >
+            Reconnect IBKR
+          </button>
+        </div>
+      )}
+
       {conn?.broker_mode === "simulator" && (
         <div className="banner-sim">
           <span>
@@ -374,9 +403,9 @@ export function App() {
           </span>
           <button
             className="mini-btn"
-            onClick={() => setShowBrokerConfig(true)}
+            onClick={() => handleModeSwitch("ibkr")}
           >
-            Connect IBKR Paper
+            Switch to IBKR Paper
           </button>
         </div>
       )}
@@ -444,10 +473,26 @@ export function App() {
           <strong className="kpi-value">{fmtMoney(account?.net_liquidation)}</strong>
           <span className="muted-sm">{account?.account_id ?? "Disconnected"}</span>
         </div>
-        <div className="kpi-card">
-          <span className="kpi-label">Cash Balance</span>
+        <div className="kpi-card kpi-card-cash">
+          <div className="kpi-header-flex">
+            <span className="kpi-label">Cash Balance</span>
+            <button
+              type="button"
+              className="mini-fx-btn"
+              onClick={() => setShowConvertModal(true)}
+              title="Convert SGD to USD"
+            >
+              <ArrowDownUp size={11} />
+              Convert
+            </button>
+          </div>
           <strong className="kpi-value">{fmtMoney(account?.cash)}</strong>
-          <span className="muted-sm">{account?.currency ?? "USD"}</span>
+          <div className="curr-breakdown">
+            <span className="curr-pill">USD ${account?.currency_balances?.USD?.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 }) ?? account?.cash?.toFixed(0) ?? "0"}</span>
+            <span className="curr-pill sgd">
+              SGD S${account?.currency_balances?.SGD?.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 }) ?? "0"}
+            </span>
+          </div>
         </div>
         <div className="kpi-card">
           <span className="kpi-label">Buying Power</span>
@@ -623,6 +668,14 @@ export function App() {
           </aside>
         </main>
       )}
+
+      <CurrencyConverterModal
+        isOpen={showConvertModal}
+        onClose={() => setShowConvertModal(false)}
+        account={account ?? null}
+        connected={Boolean(conn?.connected)}
+        onConverted={loadSnapshot}
+      />
     </div>
   );
 }

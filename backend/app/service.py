@@ -30,10 +30,13 @@ from app.models import (
     BotPlannedOrder,
     BrokerMode,
     ConnectionStatus,
+    CurrencyConversionRequest,
+    CurrencyConversionResult,
     DashboardSnapshot,
     DataSyncRequest,
     DualMomentumAssetScore,
     DualMomentumPreview,
+    FxRateResponse,
     MarketStatus,
     NewsCheckResult,
     OrderRecord,
@@ -82,13 +85,22 @@ class TradingService:
             llm_timeout_seconds=settings.news_guard_llm_timeout_seconds,
         )
         self._simulator = PaperSimulator(initial_cash=100_000.0)
+        persisted_mode = self._store.get_config("broker_mode")
+        persisted_host = self._store.get_config("ibkr_host")
+        persisted_port = self._store.get_config("ibkr_port")
+        persisted_client_id = self._store.get_config("ibkr_client_id")
+
         self._ibkr = IBKRClient(
-            host=settings.ibkr_host,
-            port=settings.ibkr_port,
-            client_id=settings.ibkr_client_id,
+            host=persisted_host or settings.ibkr_host,
+            port=int(persisted_port) if persisted_port else settings.ibkr_port,
+            client_id=int(persisted_client_id) if persisted_client_id else settings.ibkr_client_id,
             allow_live_trading=settings.allow_live_trading,
         )
-        self._mode: BrokerMode = settings.broker_mode
+        self._mode: BrokerMode = (
+            persisted_mode if persisted_mode in ("simulator", "ibkr") else settings.broker_mode
+        )  # type: ignore[assignment]
+        if self._mode == "ibkr":
+            self._ibkr._want_connected = True
         self._watchlist: list[str] = list(settings.watchlist_symbols)
         self._risk = RiskGuard(
             RiskLimits(
@@ -580,17 +592,24 @@ class TradingService:
             await self.disconnect()
 
         self._mode = mode
+        self._store.set_config("broker_mode", mode)
         if mode == "ibkr":
+            h = host or self._settings.ibkr_host
+            p = port or self._settings.ibkr_port
+            cid = client_id or self._settings.ibkr_client_id
+            self._store.set_config("ibkr_host", h)
+            self._store.set_config("ibkr_port", str(p))
+            self._store.set_config("ibkr_client_id", str(cid))
             self._ibkr = IBKRClient(
-                host=host or self._settings.ibkr_host,
-                port=port or self._settings.ibkr_port,
-                client_id=client_id or self._settings.ibkr_client_id,
+                host=h,
+                port=p,
+                client_id=cid,
                 allow_live_trading=self._settings.allow_live_trading,
             )
             self.log_activity(
                 "info",
                 "connection",
-                f"Switched to IBKR mode ({self._ibkr.status().host}:{self._ibkr.status().port}).",
+                f"Switched to IBKR mode ({h}:{p}, clientId={cid}).",
             )
             return self._ibkr.status()
 
@@ -643,6 +662,57 @@ class TradingService:
         self._store.upsert_order(record, self._mode)
         self.log_activity("warning", "order", f"Cancelled order #{order_id}.")
         return record
+
+    async def get_fx_rate(self, pair: str = "USDSGD") -> FxRateResponse:
+        return await self.broker.get_fx_rate(pair)
+
+    async def convert_currency(
+        self, req: CurrencyConversionRequest
+    ) -> CurrencyConversionResult:
+        if self._risk.trading_halted:
+            raise RiskViolation(
+                f"Trading is halted ({self._risk.status().halt_reason or 'kill switch active'}). Currency conversion blocked."
+            )
+        result = await self.broker.convert_currency(req)
+        if result.success:
+            self.log_activity(
+                "success",
+                "fx",
+                f"Currency Conversion: {result.from_amount:,.2f} {result.from_currency} -> "
+                f"{result.to_amount:,.2f} {result.to_currency} via {result.exchange} (Rate: {result.rate:.4f})",
+            )
+            if result.order_id:
+                order_rec = OrderRecord(
+                    order_id=result.order_id,
+                    symbol="USD.SGD",
+                    side="BUY" if result.from_currency == "SGD" else "SELL",
+                    quantity=int(
+                        round(
+                            result.to_amount
+                            if result.from_currency == "SGD"
+                            else result.from_amount
+                        )
+                    ),
+                    filled_quantity=int(
+                        round(
+                            result.to_amount
+                            if result.from_currency == "SGD"
+                            else result.from_amount
+                        )
+                    )
+                    if result.status == "Filled"
+                    else 0,
+                    order_type=req.order_type,
+                    limit_price=req.limit_price,
+                    avg_fill_price=result.rate,
+                    status=result.status,  # type: ignore[arg-type]
+                    source="fx:convert",
+                    message=result.message,
+                    created_at=result.created_at,
+                    updated_at=result.created_at,
+                )
+                self._store.upsert_order(order_rec, self._mode)
+        return result
 
     async def set_kill_switch(
         self, halted: bool, cancel_open_orders: bool = True, reason: str | None = None

@@ -50,6 +50,7 @@ class AccountSummary(BaseModel):
     realized_pnl: float
     daily_pnl: float = 0.0
     currency: str = "USD"
+    currency_balances: dict[str, float] = Field(default_factory=dict)
 
 
 class Position(BaseModel):
@@ -585,6 +586,49 @@ class NewsCheckResult(BaseModel):
     earnings_date: str | None = None
     headlines: list[NewsHeadline] = Field(default_factory=list)
     checked_at: datetime = Field(default_factory=utc_now)
+
+
+class CurrencyConversionRequest(BaseModel):
+    from_currency: str = Field(default="SGD", description="Source currency code (e.g. SGD)")
+    to_currency: str = Field(default="USD", description="Target currency code (e.g. USD)")
+    amount: float = Field(gt=0, description="Amount to convert")
+    amount_currency: str = Field(
+        default="SGD", description="Currency of the specified amount (SGD or USD)"
+    )
+    order_type: Literal["MKT", "LMT"] = Field(
+        default="MKT", description="Order type: MKT or LMT"
+    )
+    limit_price: float | None = Field(
+        default=None, gt=0, description="Optional limit exchange rate (USD/SGD)"
+    )
+    exchange: Literal["IDEALPRO", "FXCONV"] = Field(
+        default="IDEALPRO", description="Routing destination: IDEALPRO or FXCONV"
+    )
+
+
+class CurrencyConversionResult(BaseModel):
+    success: bool
+    order_id: int | None = None
+    from_currency: str
+    to_currency: str
+    from_amount: float
+    to_amount: float
+    rate: float
+    exchange: str
+    status: str
+    message: str
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class FxRateResponse(BaseModel):
+    pair: str  # e.g. "USDSGD"
+    base_currency: str  # "USD"
+    quote_currency: str  # "SGD"
+    rate: float  # e.g. 1.2870 (SGD per 1 USD)
+    bid: float
+    ask: float
+    inverse_rate: float  # 1 / rate (USD per 1 SGD)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class DashboardSnapshot(BaseModel):

@@ -15,9 +15,12 @@ from app.models import (
     BotDryRunPreview,
     BrokerMode,
     ConnectionStatus,
+    CurrencyConversionRequest,
+    CurrencyConversionResult,
     DashboardSnapshot,
     DataSyncRequest,
     DualMomentumPreview,
+    FxRateResponse,
     MarketStatus,
     MomentumMode,
     NewsCheckResult,
@@ -181,6 +184,32 @@ async def cancel_order(
     try:
         return await svc.cancel_order(order_id)
     except BrokerError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/fx/rate", response_model=FxRateResponse)
+async def get_fx_rate(
+    pair: str = Query(default="USDSGD"),
+    svc: TradingService = Depends(get_service),
+) -> FxRateResponse:
+    try:
+        return await svc.get_fx_rate(pair)
+    except BrokerError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.post("/fx/convert", response_model=CurrencyConversionResult)
+async def convert_currency(
+    body: CurrencyConversionRequest,
+    svc: TradingService = Depends(get_service),
+) -> CurrencyConversionResult:
+    try:
+        return await svc.convert_currency(body)
+    except RiskViolation as exc:
+        svc.log_activity("error", "risk", f"FX Conversion blocked: {exc}")
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except BrokerError as exc:
+        svc.log_activity("error", "fx", f"FX Conversion failed: {exc}")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

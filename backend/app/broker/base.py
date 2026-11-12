@@ -5,6 +5,9 @@ from abc import ABC, abstractmethod
 from app.models import (
     AccountSummary,
     ConnectionStatus,
+    CurrencyConversionRequest,
+    CurrencyConversionResult,
+    FxRateResponse,
     OrderRecord,
     OrderRequest,
     Position,
@@ -66,4 +69,14 @@ class BrokerClient(ABC):
         self, symbol: str, count: int = 60, timeframe: Timeframe = "5 mins"
     ) -> list[PriceBar]:
         """Fetch recent OHLCV bars for charting and strategy evaluation."""
+
+    @abstractmethod
+    async def get_fx_rate(self, pair: str = "USDSGD") -> FxRateResponse:
+        """Fetch current exchange rate for a currency pair."""
+
+    @abstractmethod
+    async def convert_currency(
+        self, req: CurrencyConversionRequest
+    ) -> CurrencyConversionResult:
+        """Convert cash balances between currencies (e.g. SGD to USD)."""
 

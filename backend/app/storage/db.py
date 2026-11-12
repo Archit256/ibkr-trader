@@ -103,8 +103,31 @@ class TradingStore:
                     last_checked_at TEXT,
                     trades_placed INTEGER NOT NULL DEFAULT 0
                 );
+
+                CREATE TABLE IF NOT EXISTS system_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
+
+    def set_config(self, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO system_config (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (key, str(value)),
+            )
+
+    def get_config(self, key: str, default: str | None = None) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM system_config WHERE key = ?", (key,)
+            ).fetchone()
+            return row["value"] if row else default
 
     def upsert_order(self, order: OrderRecord, broker_mode: str) -> None:
         with self._connect() as conn:
