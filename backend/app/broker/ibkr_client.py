@@ -268,34 +268,50 @@ class IBKRClient(BrokerClient):
 
     async def get_account_summary(self) -> AccountSummary:
         self._ensure_connected()
-        try:
-            values = await asyncio.wait_for(self._ib.accountSummaryAsync(), timeout=5.0)
-        except TimeoutError as exc:
-            raise BrokerError("Timed out fetching IBKR account summary.") from exc
+
+        # 1. Prefer self._ib.accountValues() which is continuously streamed into memory by TWS
+        raw_values = self._ib.accountValues()
+        if not raw_values:
+            try:
+                raw_values = await asyncio.wait_for(
+                    self._ib.accountSummaryAsync(), timeout=3.0
+                )
+            except (TimeoutError, Exception):
+                raw_values = []
+
         by_tag: dict[str, float] = {}
-        account_id = "IBKR"
+        managed = self._ib.managedAccounts()
+        account_id = managed[0] if managed else "IBKR"
         currency = "USD"
-        for item in values:
-            account_id = item.account or account_id
-            if item.tag in (
+        for item in raw_values:
+            if getattr(item, "account", None):
+                account_id = item.account
+            tag = item.tag
+            if tag in (
                 "NetLiquidation",
                 "TotalCashValue",
                 "BuyingPower",
                 "UnrealizedPnL",
                 "RealizedPnL",
             ):
-                by_tag[item.tag] = _safe_float(item.value)
-                if item.currency and item.currency != "BASE":
+                by_tag[tag] = _safe_float(item.value)
+                if getattr(item, "currency", None) and item.currency != "BASE":
                     currency = item.currency
+            elif "$LEDGER-UnrealizedPnL" in tag and "UnrealizedPnL" not in by_tag:
+                by_tag["UnrealizedPnL"] = _safe_float(item.value)
+            elif "$LEDGER-RealizedPnL" in tag and "RealizedPnL" not in by_tag:
+                by_tag["RealizedPnL"] = _safe_float(item.value)
 
+        u_pnl = by_tag.get("UnrealizedPnL", 0.0)
+        r_pnl = by_tag.get("RealizedPnL", 0.0)
         return AccountSummary(
             account_id=account_id,
             net_liquidation=by_tag.get("NetLiquidation", 0.0),
             cash=by_tag.get("TotalCashValue", 0.0),
             buying_power=by_tag.get("BuyingPower", 0.0),
-            unrealized_pnl=by_tag.get("UnrealizedPnL", 0.0),
-            realized_pnl=by_tag.get("RealizedPnL", 0.0),
-            daily_pnl=by_tag.get("UnrealizedPnL", 0.0) + by_tag.get("RealizedPnL", 0.0),
+            unrealized_pnl=u_pnl,
+            realized_pnl=r_pnl,
+            daily_pnl=round(u_pnl + r_pnl, 2),
             currency=currency,
         )
 
